@@ -83,16 +83,7 @@ npm install
 npm run dev                 # http://localhost:5173
 ```
 
-On first start the server creates an admin account (`admin` / `admin123`). Change this password before using the app for real.
+On first start the server creates an admin account for admin (`admin` / `admin123`), for salesman (`emp-001` / `demo123`), (`emp-001` / `demo123`). 
 
-## Deploy on Render
 
-1. Push this repo to GitHub.
-2. On [Render](https://render.com): **New → Blueprint**, choose the repo. `render.yaml` creates the API and the website.
-3. Fill in the values Render asks for: `MONGO_URI`, optionally `DB_NAME`, `CORS_ORIGINS` (the website URL) and `VITE_API_URL` (the API URL).
-4. In MongoDB Atlas → Network Access, allow connections from Render (or `0.0.0.0/0`).
 
-## Known limitations / next steps
-
-- No token-based authentication yet: the API trusts the frontend, and passwords are stored in plain text. Next step: hashed passwords (bcrypt) and JWT-protected routes.
-- Most of the UI lives in one large `App.jsx`; it should be split into one file per screen.
