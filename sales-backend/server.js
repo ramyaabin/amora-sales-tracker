@@ -1,0 +1,740 @@
+/* ===================== IMPORTS ===================== */
+import express from "express";
+import mongoose from "mongoose";
+import cors from "cors";
+import dotenv from "dotenv";
+
+import nodemailer from "nodemailer";
+import crypto from "crypto";
+import Product from "./models/Product.js";
+import User from "./models/User.js";
+import Sale from "./models/Sale.js";
+import Leave from "./models/Leave.js";
+import uploadUsersRoute from "./routes/uploadUsers.js";
+import excelUploadRoute from "./routes/excelUploadRoute.js"; // ✅ ADDED
+
+/* ===================== ENV ===================== */
+dotenv.config();
+
+if (!process.env.MONGO_URI) {
+  console.error("❌ ERROR: MONGO_URI not set");
+  process.exit(1);
+}
+
+/* ===================== APP INIT ===================== */
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+/* ===================== CORS ===================== */
+// Allowed frontends: built-in list plus any in CORS_ORIGINS (comma-separated),
+// so a new deployment can be added without changing code
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://salesapp-c1xw.onrender.com",
+  "https://salesapp-yqxl.onrender.com",
+  ...(process.env.CORS_ORIGINS || "")
+    .split(",")
+    .map((o) => o.trim().replace(/\/$/, ""))
+    .filter(Boolean),
+];
+app.use(
+  cors({
+    origin: allowedOrigins,
+    credentials: true,
+  }),
+);
+
+app.use(express.json());
+
+/* ===================== OTP STORE ===================== */
+// In-memory store: { username: { otp, expiry } }
+const otpStore = new Map();
+
+const createTransporter = () =>
+  nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: process.env.GMAIL_USER,
+      pass: process.env.GMAIL_APP_PASSWORD,
+    },
+  });
+
+/* ===================== UAE TIME ===================== */
+// Leave hours are in UAE time; the server itself may run in UTC (Render)
+const uaeNow = () => {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Dubai",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    })
+      .formatToParts(new Date())
+      .map((p) => [p.type, p.value]),
+  );
+  return {
+    today: `${parts.year}-${parts.month}-${parts.day}`,
+    time: `${parts.hour}:${parts.minute}`,
+  };
+};
+
+/* ===================== REQUEST LOG ===================== */
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
+
+/* ===================== ROUTES ===================== */
+app.use("/api", uploadUsersRoute);
+app.use("/api", excelUploadRoute); // ✅ ADDED — enables POST /api/upload-excel
+
+/* ===================== HEALTH ===================== */
+app.get("/", (req, res) => {
+  res.json({
+    status: "running",
+    mongodb:
+      mongoose.connection.readyState === 1 ? "connected ✅" : "disconnected ❌",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get("/api/test", (req, res) => {
+  res.json({
+    message: "API working ✅",
+    mongodb:
+      mongoose.connection.readyState === 1 ? "connected ✅" : "disconnected ❌",
+  });
+});
+
+/* ===================== FORGOT PASSWORD (OTP) ===================== */
+
+// Step 1: Request OTP — only works for admin accounts with an email set
+app.post("/api/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email)
+      return res.status(400).json({ error: "Email address is required" });
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user)
+      return res
+        .status(404)
+        .json({ error: "No account found with that email address" });
+    if (user.role !== "admin") {
+      return res.status(403).json({
+        error:
+          "Password reset via OTP is only available for admin accounts. Contact your admin to reset your password.",
+      });
+    }
+    if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+      return res.status(500).json({
+        error:
+          "Email service not configured on server. Set GMAIL_USER and GMAIL_APP_PASSWORD in environment.",
+      });
+    }
+
+    // Generate 6-digit OTP, valid 5 minutes
+    const otp = crypto.randomInt(100000, 999999).toString();
+    const emailKey = email.toLowerCase().trim();
+    otpStore.set(emailKey, {
+      otp,
+      expiry: Date.now() + 5 * 60 * 1000,
+      username: user.username,
+    });
+
+    const transporter = createTransporter();
+    await transporter.sendMail({
+      from: `"Amora Sales App" <${process.env.GMAIL_USER}>`,
+      to: user.email,
+      subject: "Your Password Reset OTP – Amora Sales Tracker",
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; border: 1px solid #e0e0e0; border-radius: 8px;">
+          <h2 style="color: #cc0000; margin-bottom: 8px;">Amora Sales Tracker</h2>
+          <p style="color: #333; font-size: 15px;">A password reset was requested for the admin account associated with <strong>${user.email}</strong>.</p>
+          <div style="background: #f5f5f5; border-radius: 6px; padding: 24px; text-align: center; margin: 24px 0;">
+            <p style="margin: 0 0 8px; color: #666; font-size: 13px;">Your one-time password (OTP)</p>
+            <p style="margin: 0; font-size: 40px; font-weight: bold; letter-spacing: 8px; color: #cc0000;">${otp}</p>
+          </div>
+          <p style="color: #666; font-size: 13px;">This OTP expires in <strong>5 minutes</strong>. If you did not request this, please ignore this email.</p>
+        </div>
+      `,
+    });
+
+    console.log("✅ OTP sent to", user.email);
+    // Return masked email so frontend can show "sent to g***@gmail.com"
+    const masked = user.email.replace(/(.{1,2})[^@]*(@.+)/, "$1***$2");
+    res.json({ success: true, maskedEmail: masked });
+  } catch (err) {
+    console.error("❌ Forgot password error:", err.message);
+    res.status(500).json({ error: "Failed to send OTP: " + err.message });
+  }
+});
+
+// Step 2: Verify OTP
+app.post("/api/verify-otp", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp)
+      return res.status(400).json({ error: "Email and OTP required" });
+
+    const emailKey = email.toLowerCase().trim();
+    const stored = otpStore.get(emailKey);
+    if (!stored)
+      return res.status(400).json({ error: "No OTP requested for this email" });
+    if (Date.now() > stored.expiry) {
+      otpStore.delete(emailKey);
+      return res
+        .status(400)
+        .json({ error: "OTP has expired. Please request a new one." });
+    }
+    if (stored.otp !== otp.trim()) {
+      return res
+        .status(400)
+        .json({ error: "Invalid OTP. Please check and try again." });
+    }
+
+    // OTP valid — mark as verified so reset step can proceed
+    otpStore.set(emailKey, { ...stored, verified: true });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Verify OTP error:", err.message);
+    res.status(500).json({ error: "Failed to verify OTP" });
+  }
+});
+
+// Step 3: Reset password (only if OTP was verified)
+app.post("/api/reset-password-otp", async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+    if (!email || !newPassword)
+      return res.status(400).json({ error: "Email and new password required" });
+    if (newPassword.length < 6)
+      return res
+        .status(400)
+        .json({ error: "Password must be at least 6 characters" });
+
+    const emailKey = email.toLowerCase().trim();
+    const stored = otpStore.get(emailKey);
+    if (!stored || !stored.verified) {
+      return res.status(403).json({
+        error: "OTP not verified. Please complete verification first.",
+      });
+    }
+
+    // Use the username saved in the OTP record to update the correct account
+    const user = await User.findOneAndUpdate(
+      { username: stored.username },
+      { password: newPassword },
+      { new: true },
+    );
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    otpStore.delete(emailKey);
+    console.log("✅ Password reset via OTP for admin:", stored.username);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Reset password error:", err.message);
+    res.status(500).json({ error: "Failed to reset password" });
+  }
+});
+
+/* ===================== USERS ===================== */
+app.get("/api/users", async (req, res) => {
+  try {
+    const users = await User.find().select("-__v");
+    res.json(users);
+  } catch {
+    res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
+
+app.post("/api/users", async (req, res) => {
+  try {
+    const { username, password, name, role, salesmanId } = req.body;
+
+    if (!username || !password || !name || !role) {
+      return res.status(400).json({ error: "All fields required" });
+    }
+
+    if (await User.findOne({ username })) {
+      return res.status(400).json({ error: "Username exists" });
+    }
+
+    const user = await User.create({
+      username,
+      password,
+      name,
+      role,
+      salesmanId: role === "salesman" ? salesmanId : undefined,
+    });
+
+    res.status(201).json({ success: true, user });
+  } catch (err) {
+    // 11000 = MongoDB duplicate key (username or salesmanId already used)
+    if (err.code === 11000) {
+      const field = Object.keys(err.keyValue || {})[0] || "value";
+      return res
+        .status(400)
+        .json({ error: `${field} "${err.keyValue?.[field]}" already exists` });
+    }
+    console.error("❌ Failed to add user:", err.message);
+    res.status(500).json({ error: "Failed to add user" });
+  }
+});
+
+// ✅ ADDED — Password reset endpoint (called from api.js resetPassword())
+app.put("/api/users/:salesmanId/password", async (req, res) => {
+  try {
+    const { salesmanId } = req.params;
+    const { password } = req.body;
+
+    if (!password) {
+      return res.status(400).json({ error: "Password is required" });
+    }
+
+    const user = await User.findOneAndUpdate(
+      { salesmanId },
+      { password },
+      { new: true },
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json({ success: true, user });
+  } catch {
+    res.status(500).json({ error: "Failed to reset password" });
+  }
+});
+
+app.delete("/api/users/:salesmanId", async (req, res) => {
+  try {
+    const { salesmanId } = req.params;
+    await User.deleteOne({ salesmanId });
+    await Sale.deleteMany({ salesmanId });
+    await Leave.deleteMany({ salesmanId });
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: "Failed to delete user" });
+  }
+});
+
+/* ===================== LOGIN ===================== */
+app.post("/api/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    // Normalize username to lowercase (schema stores lowercase) + use lean() for faster query
+    const user = await User.findOne({
+      username: username?.toLowerCase().trim(),
+      password,
+    }).lean();
+
+    if (!user) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    res.json({ success: true, user });
+  } catch {
+    res.status(500).json({ error: "Login failed" });
+  }
+});
+
+/* ===================== PRODUCTS ===================== */
+app.get("/api/products", async (req, res) => {
+  try {
+    const { search, brand, category } = req.query;
+
+    let query = {};
+
+    if (search) {
+      const regex = new RegExp(search, "i");
+      // ✅ Use $or with regex only — avoid $text index which may be stale/missing
+      query.$or = [
+        { brand: regex },
+        { Brand: regex },
+        { description: regex },
+        { Description: regex },
+        { modelNumber: regex },
+        { ModelNo: regex },
+        { itemCode: regex },
+      ];
+    }
+
+    if (brand) {
+      query.$or = [
+        { brand: new RegExp(brand, "i") },
+        { Brand: new RegExp(brand, "i") },
+      ];
+    }
+
+    if (category) query.category = category;
+
+    const raw = await Product.find(query).sort({ Brand: 1, brand: 1 }).lean();
+
+    console.log(`📦 GET /api/products — found ${raw.length} documents`);
+    if (raw.length > 0) {
+      console.log("📦 Sample raw doc keys:", Object.keys(raw[0]));
+    }
+
+    // ✅ Normalize every product so the frontend always gets consistent fields.
+    // Resolves field names from your actual Excel columns:
+    //   Brand | ModelNo. | Barcode | Description | RSP+VAT
+    const products = raw.map((p) => ({
+      ...p,
+      // brand
+      brand: String(p.brand || p.Brand || "").trim(),
+      // modelNumber — "ModelNo." stored by MongoDB as { "": value } due to dot in key name
+      modelNumber: (() => {
+        const raw = p.modelNumber || p.modelNo || p["Model "] || p.Model;
+        if (raw) return String(raw).trim();
+        const mn = p.ModelNo || p["ModelNo."];
+        if (mn && typeof mn === "object") {
+          const v = Object.values(mn)[0];
+          return v !== undefined ? String(v).trim() : "";
+        }
+        return mn ? String(mn).trim() : "";
+      })(),
+      // itemCode — Excel has no Item Code column, may be empty
+      itemCode: String(
+        p.itemCode || p["Item Code"] || p.itemcode || p.ItemCode || "",
+      ).trim(),
+      // ean/barcode — Excel column is "Barcode"
+      ean: String(p.ean || p.EAN || p.Barcode || p.barcode || "").trim(),
+      // description — Excel column is "Description"
+      description: String(
+        p.description || p.Description || p["Item Description"] || "",
+      ).trim(),
+      // price — Excel stores as " RSP+VAT " (may have surrounding spaces)
+      // Loop over actual keys with .trim() so spaces don't break the match
+      price: (() => {
+        for (const key of Object.keys(p)) {
+          if (["RSP+VAT", "RSP+Vat", "RSP+VAT"].includes(key.trim())) {
+            if (Number(p[key]) > 0) return Number(p[key]);
+          }
+        }
+        return (
+          (p["RSP+VAT"] > 0 ? p["RSP+VAT"] : null) ||
+          (p["RSP+Vat"] > 0 ? p["RSP+Vat"] : null) ||
+          (p[" RSP+Vat "] > 0 ? p[" RSP+Vat "] : null) ||
+          (p["RSP + VAT"] > 0 ? p["RSP + VAT"] : null) ||
+          (p.rspVat > 0 ? p.rspVat : null) ||
+          (p.price > 0 ? p.price : null) ||
+          (p.Price > 0 ? p.Price : null) ||
+          0
+        );
+      })(),
+      rspVat: (() => {
+        for (const key of Object.keys(p)) {
+          if (["RSP+VAT", "RSP+Vat"].includes(key.trim())) {
+            if (Number(p[key]) > 0) return Number(p[key]);
+          }
+        }
+        return (
+          (p["RSP+VAT"] > 0 ? p["RSP+VAT"] : null) ||
+          (p["RSP+Vat"] > 0 ? p["RSP+Vat"] : null) ||
+          (p[" RSP+Vat "] > 0 ? p[" RSP+Vat "] : null) ||
+          (p.rspVat > 0 ? p.rspVat : null) ||
+          (p.price > 0 ? p.price : null) ||
+          0
+        );
+      })(),
+    }));
+
+    res.json(products);
+  } catch (err) {
+    // ✅ Log the REAL error so it appears in Render logs
+    console.error("❌ GET /api/products error:", err.message, err.stack);
+    res.status(500).json({ error: "Failed to fetch products: " + err.message });
+  }
+});
+
+app.post("/api/products", async (req, res) => {
+  try {
+    const product = await Product.create(req.body);
+    res.status(201).json({ success: true, product });
+  } catch {
+    res.status(500).json({ error: "Failed to add product" });
+  }
+});
+
+/* ===================== SALES ===================== */
+app.get("/api/sales", async (req, res) => {
+  try {
+    const { salesmanId, date, month } = req.query;
+    let query = {};
+    if (salesmanId) query.salesmanId = salesmanId;
+    if (date) query.date = date;
+    if (month) query.date = { $regex: `^${month}` };
+
+    res.json(await Sale.find(query).sort({ date: -1 }));
+  } catch {
+    res.status(500).json({ error: "Failed to fetch sales" });
+  }
+});
+
+app.post("/api/sales", async (req, res) => {
+  try {
+    const {
+      salesmanId,
+      salesmanName,
+      date,
+      location,
+      brand,
+      itemCode,
+      barcode,
+      description,
+      quantity,
+      price,
+      totalAmount,
+    } = req.body;
+
+    if (!salesmanId)
+      return res.status(400).json({ error: "salesmanId is required" });
+    if (!salesmanName)
+      return res.status(400).json({ error: "salesmanName is required" });
+    if (!date) return res.status(400).json({ error: "date is required" });
+    if (!brand) return res.status(400).json({ error: "brand is required" });
+    if (!quantity)
+      return res.status(400).json({ error: "quantity is required" });
+    if (!price) return res.status(400).json({ error: "price is required" });
+
+    // Block sales while the salesman is on approved leave
+    const leave = await Leave.findOne({ salesmanId, date, status: "Approved" });
+    if (leave) {
+      if (leave.leaveType !== "partial") {
+        return res.status(403).json({
+          error: `You are on approved leave on ${date}, so sales can't be added for this day.`,
+        });
+      }
+      const { today, time } = uaeNow();
+      if (date === today && time >= leave.fromTime && time < leave.toTime) {
+        return res.status(403).json({
+          error: `You are on leave from ${leave.fromTime} to ${leave.toTime} today. You can add sales again from ${leave.toTime}.`,
+        });
+      }
+    }
+
+    const sale = await Sale.create({
+      salesmanId,
+      salesmanName,
+      date,
+      location: location || "",
+      brand,
+      itemCode: String(itemCode),
+      barcode: barcode || "",
+      description: description || "",
+      quantity: Number(quantity),
+      price: Number(price),
+      totalAmount: Number(totalAmount || quantity * price),
+    });
+
+    res.status(201).json({ success: true, sale });
+  } catch (err) {
+    console.error("❌ Failed to add sale:", err.message, err);
+    res.status(500).json({ error: err.message || "Failed to add sale" });
+  }
+});
+
+// ✅ ADDED — Delete a sale
+app.delete("/api/sales/:id", async (req, res) => {
+  try {
+    await Sale.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: "Failed to delete sale" });
+  }
+});
+
+/* ===================== LEAVES ===================== */
+app.get("/api/leaves", async (req, res) => {
+  try {
+    const { salesmanId, date, month } = req.query;
+    let query = {};
+    if (salesmanId) query.salesmanId = salesmanId;
+    if (date) query.date = date;
+    if (month) query.date = { $regex: `^${month}` }; // ✅ ADDED month filter
+
+    res.json(await Leave.find(query).sort({ date: -1 }));
+  } catch {
+    res.status(500).json({ error: "Failed to fetch leaves" });
+  }
+});
+
+app.post("/api/leaves", async (req, res) => {
+  try {
+    const { salesmanId, salesmanName, date, reason } = req.body;
+    const leaveType = req.body.leaveType === "partial" ? "partial" : "full";
+    const fromTime = leaveType === "partial" ? req.body.fromTime || "" : "";
+    const toTime = leaveType === "partial" ? req.body.toTime || "" : "";
+    if (leaveType === "partial") {
+      const hhmm = /^([01]\d|2[0-3]):[0-5]\d$/;
+      if (!hhmm.test(fromTime) || !hhmm.test(toTime) || fromTime >= toTime) {
+        return res.status(400).json({
+          error: "For part-day leave, enter a valid From and To time (To must be after From).",
+        });
+      }
+    }
+
+    // ✅ Validate required fields explicitly with clear error messages
+    if (!salesmanId)
+      return res.status(400).json({
+        error:
+          "salesmanId is required. The logged-in user may not have a salesmanId assigned.",
+      });
+    if (!salesmanName)
+      return res.status(400).json({ error: "salesmanName is required" });
+    if (!date) return res.status(400).json({ error: "date is required" });
+    if (!reason) return res.status(400).json({ error: "reason is required" });
+
+    // Check for duplicate
+    const existing = await Leave.findOne({ salesmanId, date });
+    if (existing) {
+      return res
+        .status(400)
+        .json({ error: "Leave already applied for this date" });
+    }
+
+    // ✅ Build leave explicitly (ignore frontend timestamp — let schema default handle it)
+    const leave = await Leave.create({
+      salesmanId,
+      salesmanName,
+      date,
+      reason,
+      leaveType,
+      fromTime,
+      toTime,
+      status: "Pending",
+    });
+
+    res.status(201).json({ success: true, leave });
+  } catch (err) {
+    // ✅ Log and return the real error so it's visible in Render logs + browser
+    console.error("❌ Failed to add leave:", err.message, err);
+    res.status(500).json({ error: err.message || "Failed to add leave" });
+  }
+});
+
+// ✅ ADDED — Approve / Reject leave (used by admin dashboard)
+app.patch("/api/leaves/:id", async (req, res) => {
+  try {
+    const { status, adminRemark } = req.body;
+    // "Cancelled" = admin withdrew the leave (e.g. salesman decided to work); it no longer blocks sales
+    if (!["Pending", "Approved", "Rejected", "Cancelled"].includes(status)) {
+      return res.status(400).json({ error: "Invalid leave status" });
+    }
+    const updated = await Leave.findByIdAndUpdate(
+      req.params.id,
+      {
+        status,
+        adminRemark: adminRemark || "",
+        actionAt: new Date(), // ✅ timestamp when admin acted
+      },
+      { new: true },
+    );
+
+    if (!updated) {
+      return res.status(404).json({ error: "Leave not found" });
+    }
+
+    res.json({ success: true, leave: updated });
+  } catch {
+    res.status(500).json({ error: "Failed to update leave status" });
+  }
+});
+
+// ✅ ADDED — Delete a leave
+app.delete("/api/leaves/:id", async (req, res) => {
+  try {
+    await Leave.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: "Failed to delete leave" });
+  }
+});
+
+/* ===================== STATS ===================== */
+app.get("/api/stats", async (req, res) => {
+  try {
+    const sales = await Sale.find();
+    const totalAmount = sales.reduce(
+      (sum, s) => sum + (s.totalAmount || s.quantity * s.price),
+      0,
+    );
+    const totalSalesmen = await User.countDocuments({ role: "salesman" });
+
+    res.json({
+      totalAmount,
+      totalTransactions: sales.length,
+      totalSalesmen,
+    });
+  } catch {
+    res.status(500).json({ error: "Failed to fetch stats" });
+  }
+});
+
+/* ===================== 404 ===================== */
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
+});
+
+/* ===================== CONNECT DB & START SERVER ===================== */
+// DB_NAME picks the database (e.g. "amora_demo"); if unset, the one in MONGO_URI is used
+mongoose
+  .connect(process.env.MONGO_URI, process.env.DB_NAME ? { dbName: process.env.DB_NAME } : {})
+  .then(async () => {
+    console.log(`✅ MongoDB connected (database: ${mongoose.connection.name})`);
+
+    // ✅ Drop stale index from old schema that used fromDate instead of date.
+    // This index causes E11000 duplicate key errors on every leave insert.
+    try {
+      await Leave.collection.dropIndex("salesmanId_1_fromDate_1");
+      console.log("✅ Dropped stale leaves index: salesmanId_1_fromDate_1");
+    } catch (e) {
+      // Index may not exist on fresh deployments — that is fine
+      if (e.code !== 27)
+        console.warn("⚠️ Could not drop stale index:", e.message);
+    }
+
+    // ✅ Drop stale itemCode index — old schema stored it as Number, new schema
+    // stores it as String. The type mismatch causes query errors on the products
+    // collection. Mongoose will recreate the correct String index automatically.
+    try {
+      await Product.collection.dropIndex("itemCode_1");
+      console.log("✅ Dropped stale products index: itemCode_1");
+    } catch (e) {
+      if (e.code !== 27)
+        console.warn("⚠️ Could not drop stale product index:", e.message);
+    }
+
+    // ✅ Also drop the compound brand+itemCode index for the same reason
+    try {
+      await Product.collection.dropIndex("brand_1_itemCode_1");
+      console.log("✅ Dropped stale products index: brand_1_itemCode_1");
+    } catch (e) {
+      if (e.code !== 27)
+        console.warn("⚠️ Could not drop stale product index:", e.message);
+    }
+
+    if (!(await User.findOne({ username: "admin" }))) {
+      await User.create({
+        username: "Admin",
+        password: "admin123",
+        name: "Admin",
+        role: "admin",
+        email: "admin@gmail.com",
+      });
+      console.log("✅ Default admin created");
+    }
+
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("❌ MongoDB connection failed:", err.message);
+    process.exit(1);
+  });

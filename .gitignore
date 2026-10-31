@@ -1,0 +1,28 @@
+# Dependencies and builds
+node_modules/
+dist/
+build/
+
+# Secrets — never commit real settings (see *.env.example)
+.env
+.env.*
+!.env.example
+
+# Local data, backups and uploads (may contain company data)
+backups/
+uploads/
+sales-backend/uploads/
+sales-backend/excel.xlsx
+*.xlsx
+~$*
+
+
+# Editor / tool folders
+.qodo/
+.postman/
+postman/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
