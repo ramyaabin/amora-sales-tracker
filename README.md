@@ -1,10 +1,16 @@
 # Amora Sales Tracker
 
-## Live on Live on https://amora-sales.onrender.com/
-
 A full-stack web app for a retail sales team: salespeople record each sale from their phone, apply for leave, and see their own performance; an admin tracks the whole team's sales, approves leave, and manages staff and the product catalogue.
 
-**Live demo:** _add your Render link here_
+## Live demo: [amora-sales.onrender.com](https://amora-sales.onrender.com)
+
+| Role | Username | Password |
+|---|---|---|
+| Admin | `admin` | `admin123` |
+| Salesperson | `emp-001` | `demo123` |
+| Salesperson | `emp-002` | `demo123` |
+
+_Fictional demo data. Hosted on Render's free plan, so the first visit after a quiet period can take up to a minute while the server wakes up._
 
 ![Admin dashboard](docs/screenshots/admin-dashboard.png)
 
@@ -85,8 +91,5 @@ npm install
 npm run dev                 # http://localhost:5173
 ```
 
-On first start the server creates an admin account for admin (`admin` / `admin123`), for salesman (`emp-001` / `demo123`), (`emp-002` / `demo123`). 
-Live on https://amora-sales.onrender.com/
-
-
+On first start the server creates an admin account (`admin` / `admin123`). To load the demo salespeople (`emp-001` … `emp-012`, password `demo123`), sales and leaves, run `node scripts/importDemoData.js <csv folder> --db amora_demo --all` in `sales-backend`.
 
